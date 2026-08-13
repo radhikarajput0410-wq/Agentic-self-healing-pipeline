@@ -1,0 +1,32 @@
+name: AI Self-Healing Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  test-and-heal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Run Tests (Catch Failure)
+        id: run_tests
+        # This attempts to run your tests. If they fail, it captures the error log.
+        run: |
+          python -m unittest discover 2> error_log.txt || echo "TESTS_FAILED=true" >> $GITHUB_ENV
+          
+      - name: Trigger AI Agent via Webhook
+        if: env.TESTS_FAILED == 'true'
+        run: |
+          # Formats the error log safely into JSON and sends it to your FastAPI server
+          ERROR_CONTENT=$(cat error_log.txt | jq -R -s '.')
+          curl -X POST -H "Content-Type: application/json" \
+               -d "{\"repository\": {\"name\": \"SahiSeva\"}, \"error_log\": $ERROR_CONTENT}" \
+               ${{ secrets.WEBHOOK_URL }}
