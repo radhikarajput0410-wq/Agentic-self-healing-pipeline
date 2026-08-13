@@ -3,6 +3,7 @@ import re
 import uuid
 from dotenv import load_dotenv
 import docker
+from github import Github
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -33,7 +34,7 @@ def extract_code(text):
     match = re.search(r"```(?:python)?\n(.*?)\n```", text, re.DOTALL)
     return match.group(1) if match else text.strip()
 
-# 3. The Developer Agent Node (Now with Rate Limit Retries!)
+# 3. The Developer Agent Node
 @retry(
     stop=stop_after_attempt(3), 
     wait=wait_exponential(multiplier=5, min=5, max=30), 
@@ -81,47 +82,85 @@ print('SUCCESS')
         feedback = f"The code failed in testing with this error:\n{error_msg}\nPlease fix the code so it handles both numbers and string inputs, and return ONLY the corrected Python code."
         return {"messages": [HumanMessage(content=feedback)]}
 
-# 5. The Routing Logic
+# 5. The GitHub Pull Request Node
+def create_pr_node(state: PipelineState):
+    print("🚀 Opening Pull Request on GitHub...")
+    
+    # Extract the final, successful code from the agent's last message (before the "Test passed!" message)
+    agent_message = state["messages"][-2].content
+    fixed_code = extract_code(agent_message)
+    
+    # Authenticate to GitHub using your secure .env variables
+    g = Github(os.getenv("GITHUB_TOKEN"))
+    repo = g.get_repo(os.getenv("GITHUB_REPO_NAME"))
+    
+    # Generate a unique branch name for the fix
+    branch_name = f"ai-fix-{uuid.uuid4().hex[:8]}"
+    
+    # Create the new branch off of 'main'
+    main_branch = repo.get_branch("main")
+    repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=main_branch.commit.sha)
+    
+    file_path = "fixed_code.py" # The file the AI will create/update
+    
+    # Write the fixed code to the new branch
+    try:
+        contents = repo.get_contents(file_path, ref=branch_name)
+        repo.update_file(contents.path, "🤖 AI Self-Healing Fix", fixed_code, contents.sha, branch=branch_name)
+    except:
+        repo.create_file(file_path, "🤖 AI Self-Healing Fix", fixed_code, branch=branch_name)
+    
+    # Open the Pull Request
+    pr = repo.create_pull(
+        title="🤖 AI Automated Fix",
+        body="The LangGraph Agent has successfully fixed the failing tests. Please review the updated code.",
+        head=branch_name,
+        base="main"
+    )
+    
+    print(f"✅ Pull Request Created Successfully: {pr.html_url}")
+    return state
+
+# 6. The Routing Logic
 def route_next(state: PipelineState):
     last_message = state["messages"][-1].content
     if "Test passed!" in last_message:
-        return END
+        return "create_pr" # Routes to the new PR node instead of END
     if len(state["messages"]) > 6:
         print("🛑 Max retries reached.")
         return END
     return "developer_agent"
 
-# 6. Wire the Graph Together
+# 7. Wire the Graph Together
 workflow = StateGraph(PipelineState)
 workflow.add_node("developer_agent", write_patch_node)
 workflow.add_node("qa_sandbox", test_code_node)
+workflow.add_node("create_pr", create_pr_node) # Add the new node
+
 workflow.add_edge(START, "developer_agent")
 workflow.add_edge("developer_agent", "qa_sandbox")
 workflow.add_conditional_edges("qa_sandbox", route_next)
+workflow.add_edge("create_pr", END) # Close the loop after the PR is made
 
-# 7. NEW: FastAPI Server Setup
+# 8. FastAPI Server Setup
 app = FastAPI(title="Self-Healing CI/CD Agent")
 
-# Define the expected JSON payload format
 class WebhookPayload(BaseModel):
     error_log: Optional[str] = None
-    repository: Optional[dict] = None  # Changed from str to dict to accept GitHub's format
-    zen: Optional[str] = None # GitHub uses this for ping events
+    repository: Optional[dict] = None  
+    zen: Optional[str] = None 
 
 @app.post("/webhook/trigger")
 async def trigger_pipeline(payload: WebhookPayload):
-    # Check if this is just a GitHub ping event
     if payload.zen:
         print(f"👋 GitHub Ping Received: {payload.zen}")
         return {"status": "success", "message": "Ping acknowledged"}
         
-    # Guardrail: Ensure we actually have an error log before running LangGraph
     if not payload.error_log:
         return {"status": "ignored", "message": "No error log provided."}
 
     print(f"\n🔔 Webhook received for repo: {payload.repository}")
     
-    # Generate a unique Job ID for this execution
     run_id = f"job_{uuid.uuid4().hex[:8]}"
     print(f"📂 Starting execution track: {run_id}")
     
@@ -131,10 +170,8 @@ async def trigger_pipeline(payload: WebhookPayload):
         initial_state = {"messages": [HumanMessage(content=payload.error_log)]}
         config = {"configurable": {"thread_id": run_id}}
         
-        # Trigger the LangGraph execution
         result = agent_app.invoke(initial_state, config=config)
         
-        # Extract the final, tested code
         final_message = result["messages"][-2].content if "Test passed!" in result["messages"][-1].content else "Failed to fix code."
         
         return {
@@ -143,7 +180,6 @@ async def trigger_pipeline(payload: WebhookPayload):
             "patched_code": final_message
         }
 
-# Start the server on port 8000
 if __name__ == "__main__":
     print("🚀 Starting FastAPI Server on http://localhost:8000...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
