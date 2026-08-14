@@ -28,5 +28,5 @@ jobs:
           # Formats the error log safely into JSON and sends it to your FastAPI server
           ERROR_CONTENT=$(cat error_log.txt | jq -R -s '.')
           curl -X POST -H "Content-Type: application/json" \
-               -d "{\"repository\": {\"name\": \"SahiSeva\"}, \"error_log\": $ERROR_CONTENT}" \
+               -d "{\"repository\": {\"full_name\": \"${{ github.repository }}\"}, \"error_log\": $ERROR_CONTENT}" \
                ${{ secrets.WEBHOOK_URL }}
