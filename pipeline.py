@@ -3,9 +3,9 @@ import re
 import uuid
 from dotenv import load_dotenv
 import docker
-from github import Github
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from github import Github
 from pydantic import BaseModel
 from typing import TypedDict, Annotated, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -151,34 +151,59 @@ class WebhookPayload(BaseModel):
     zen: Optional[str] = None 
 
 @app.post("/webhook/trigger")
-async def trigger_pipeline(payload: WebhookPayload):
-    if payload.zen:
-        print(f"👋 GitHub Ping Received: {payload.zen}")
-        return {"status": "success", "message": "Ping acknowledged"}
-        
-    if not payload.error_log:
-        return {"status": "ignored", "message": "No error log provided."}
-
-    print(f"\n🔔 Webhook received for repo: {payload.repository}")
+async def trigger_webhook(request: Request):
+    # 1. Read the incoming GitHub payload
+    payload = await request.json()
     
-    run_id = f"job_{uuid.uuid4().hex[:8]}"
-    print(f"📂 Starting execution track: {run_id}")
+    # 2. Dynamically extract the repository name (e.g., "owner/repo-name")
+    repo_name = payload.get("repository", {}).get("full_name")
+    error_log = payload.get("error_log", "No error log provided.")
     
-    with SqliteSaver.from_conn_string("pipeline_state.db") as memory:
-        agent_app = workflow.compile(checkpointer=memory)
+    if not repo_name:
+        return {"status": "error", "message": "Repository name missing from payload"}
         
-        initial_state = {"messages": [HumanMessage(content=payload.error_log)]}
-        config = {"configurable": {"thread_id": run_id}}
+    print(f"🚨 Bug detected in repository: {repo_name}")
+    
+    # 3. Authenticate with GitHub using your token
+    github_token = os.getenv("GITHUB_TOKEN")
+    g = Github(github_token)
+    
+    # 4. Target the specific repository dynamically!
+    repo = g.get_repo(repo_name)
+    
+    # Run the AI Agent (Pass the error log to LangGraph)
+    print("🧠 Starting LangGraph Reasoning Agent...")
+    config = {"configurable": {"thread_id": "1"}}
+    final_state = app_graph.invoke(
+        {"messages": [("user", f"Fix this error:\n{error_log}")]}, 
+        config=config
+    )
+    
+    final_code = final_state["messages"][-1].content
+    
+    # Create a new branch and PR with the fix
+    base_branch = repo.get_branch("main")
+    new_branch_name = f"ai-fix-{uuid.uuid4().hex[:6]}"
+    repo.create_git_ref(ref=f"refs/heads/{new_branch_name}", sha=base_branch.commit.sha)
+    
+    file_contents = repo.get_contents("math_functions.py", ref="main")
+    repo.update_file(
+        file_contents.path,
+        "🤖 AI Automated Fix",
+        final_code,
+        file_contents.sha,
+        branch=new_branch_name
+    )
+    
+    repo.create_pull(
+        title="🤖 AI Automated Fix",
+        body="The LangGraph Agent has successfully fixed the failing tests. Please review the updated code.",
+        head=new_branch_name,
+        base="main"
+    )
+    
+    return {"status": "success", "message": f"Fix deployed to {repo_name}"}
         
-        result = agent_app.invoke(initial_state, config=config)
-        
-        final_message = result["messages"][-2].content if "Test passed!" in result["messages"][-1].content else "Failed to fix code."
-        
-        return {
-            "status": "success",
-            "run_id": run_id,
-            "patched_code": final_message
-        }
 
 if __name__ == "__main__":
     print("🚀 Starting FastAPI Server on http://localhost:8000...")
